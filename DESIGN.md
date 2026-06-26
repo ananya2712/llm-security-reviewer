@@ -4,7 +4,7 @@ Companion to `PLAN.md`. `PLAN.md` is the upfront goal/scope/architecture;
 this doc captures implementation-level decisions made as the code is built,
 with the rationale for each.
 
-Updated through: **step 4 (providers)**.
+Updated through: **step 7 (github_client — Milestone 1 complete)**.
 
 ---
 
@@ -381,6 +381,149 @@ empty-hunk short-circuit — all without an API key or spend. A real-API
 `smoke_anthropic.py` (anticipated in §4) is deferred; it needs a key and costs
 money, so it'll be opt-in.
 
-**Still deferred:** `openai_provider.py` (the eval comparison model — only
-needed for week-3 metrics, not Milestone-1 end-to-end), token budgeting /
-chunking, and the real-API smoke.
+**Still deferred:** token budgeting / chunking, and the real-API smoke.
+
+### 8.7 `openai_provider.py` — the eval comparison backend
+Mirrors `AnthropicProvider` for the OpenAI Chat Completions API so eval results
+differ only by model, not by harness: same `SYSTEM_PROMPT` + few-shot, same
+`ReviewResult` schema, same `Finding(source="llm")` mapping, same
+refusal-degrades-to-`[]` policy and empty-hunk short-circuit.
+
+Backend-specific deltas:
+- **System prompt rides in `messages`.** OpenAI has no separate `system` param,
+  so the call prepends `{"role": "system", ...}` then `build_messages(fd)`.
+- **`chat.completions.parse(response_format=ReviewResult)`**, parsed model on
+  `choices[0].message.parsed`; a refusal sets `message.refusal` (parsed None).
+- **No thinking/effort param** — gpt-4o-class isn't a reasoning model.
+- **Default model `gpt-4o`** (PLAN §4's "GPT-4o-class"), constructor-overridable.
+
+**Why `ReviewResult` is reused unchanged:** OpenAI strict structured outputs is
+narrower than Anthropic's, but current OpenAI accepts the numeric range
+constraints our schema carries (`confidence` 0–1, `start_line ≥ 1`). Verified
+empirically: the SDK's `openai.lib._pydantic.to_strict_json_schema(ReviewResult)`
+**keeps** `minimum`/`maximum` rather than stripping them — the SDK (kept in sync
+with the API) would drop unsupported keywords, so retaining them means the API
+takes them. No constraint-free parallel model needed.
+
+---
+
+## 9. `reviewer.py` — orchestration
+
+The seam between `diff.parse_diff` and a `ReviewProvider`. `review_diff(text,
+provider) -> ReviewReport` is the one entry point the CLI / eval call.
+
+### 9.1 The reviewer owns "what gets reviewed"
+It parses, then drops files with no hunks (`[fd for fd in parse_diff(text) if
+fd.hunks]`) before handing them to the provider.
+
+**Why here, not in the provider:** scope selection is an orchestration concern,
+not a per-backend one — every provider should review the same set. The
+provider's own empty-hunk guard (§8 / `review_file`) stays as belt-and-suspenders,
+but the reviewer is the single source of truth for which files count. This is
+also where token budgeting / chunking will slot in later without touching any
+provider.
+
+### 9.2 `ReviewReport`, not a bare `list[Finding]`
+Returns a Pydantic `ReviewReport { findings, files_reviewed }` with a
+`finding_count` convenience property.
+
+**Why:** the CLI wants to say "reviewed N files, found M issues" — including the
+zero-findings case, which a bare list can't distinguish from "nothing
+reviewed." `files_reviewed` records exactly what the model saw (post-noise,
+post-empty-hunk). Pydantic gives report.py / the eval free, stable JSON
+serialization (round-trip verified in the smoke test).
+
+### 9.3 Findings sorted by `(file, start_line, end_line, category)`
+Sorted before returning.
+
+**Why:** deterministic output makes report rendering stable and eval runs
+reproducible (diffable results across prompt iterations). The model can emit
+findings in any order; sorting normalizes it. Category sorts by its string
+value — fine since `Category` is a `str` enum.
+
+**Deferred:** cross-finding **dedup**. A single call per file rarely repeats a
+finding, so v1 skips it; revisit if overlap shows up once context expansion or
+multi-call chunking lands.
+
+---
+
+## 10. `report.py` + `cli.py` — the user-facing edge (Milestone 1)
+
+### 10.1 `report.py` is rendering-only, no I/O policy
+Exposes `render_terminal(report, console=None)` (rich table or an all-clear
+line) and `to_json(report)`.
+
+**Why split from the CLI:** rendering is the part worth unit-testing, and the
+eval harness wants `to_json` without going through argv. Passing an optional
+`console` lets tests capture output to a `StringIO` buffer instead of a TTY. The
+table shows `file:start-end`, category, severity (color-coded by urgency),
+confidence, and rationale; `to_json` is just `ReviewReport.model_dump_json` so
+the wire format is the same object the eval consumes.
+
+### 10.2 `cli.py` is thin wiring over testable helpers
+`review` does four things: `_load_diff` → `_make_provider` → `review_diff` →
+render. The two helpers are module-level so a smoke test can monkeypatch
+`_make_provider` to a fake and exercise the whole command via Typer's
+`CliRunner` — no API key, no spend.
+
+**Why `--diff` only (no PR target yet):** PR-fetch needs `github_client.py`;
+diff-file/stdin review is the v0 (PLAN §9, "diff-only is the v0"). `--diff -`
+reads stdin so `git diff | secreview review --diff -` works today.
+
+### 10.3 An `@app.callback()` keeps the `review` subcommand name
+Typer collapses a single-command app and drops the command name; an (empty)
+callback forces it to keep `secreview review …` as PLAN specifies. The
+`secreview` console script points at the `Typer` app object, which is callable.
+
+### 10.4 Provider selection is a name→class map; thinking is anthropic-only
+`--provider anthropic|openai`, optional `--model` override, `--no-thinking`
+(ignored for OpenAI, which has no thinking param). Unknown providers raise a
+`BadParameter` before any client is constructed (so it fails fast without a
+key).
+
+**Milestone 1 status:** `secreview review --diff <file>` returns findings
+end-to-end on a real diff; `github_client.py` (§11) adds PR-fetch mode. A
+real-API smoke to watch Claude flag the sample live is still nice-to-have.
+
+---
+
+## 11. `github_client.py` — PR-fetch mode
+
+### 11.1 Ask GitHub for the `.diff` representation directly
+`GET /repos/{owner}/{repo}/pulls/{n}` with `Accept: application/vnd.github.diff`
+returns the unified-diff text as the response body.
+
+**Why not `/pulls/{n}/files` (JSON):** that endpoint returns per-file patch
+fragments we'd have to stitch back into a unified diff (and it paginates at 30
+files). The `.diff` media type hands us exactly what `diff.parse_diff` already
+eats — zero reconstruction, no pagination. Base/head SHAs and richer per-file
+metadata (PLAN §3) aren't needed for diff review; they'll be added via the JSON
+endpoint when the eval/context-expansion work needs them.
+
+### 11.2 `PullRequestRef.parse` accepts shorthand and URLs
+`owner/repo#N` (the PLAN spelling) and `…github.com/owner/repo/pull/N` both
+parse; anything else raises `ValueError`.
+
+**Why both:** `owner/repo#N` is the documented CLI form, but people paste PR
+URLs constantly — accepting them costs one regex and removes a papercut.
+
+### 11.3 Single attempt, typed errors, status-specific messages
+No retries; failures raise `GitHubError` carrying the HTTP status, with messages
+tuned per case (404 → wrong ref / private repo without token; 401 → bad token;
+403 + `X-RateLimit-Remaining: 0` → set a token for a higher limit).
+
+**Why (PLAN risk table):** "single attempt + clear error first; add retries only
+if needed." The actionable message matters more than resilience at this stage —
+the most common failure (private repo, no token) is a config issue the user
+fixes once, not a transient the client should paper over. The SDK-less httpx
+client is injectable (`client=`), so the smoke test drives every status path via
+`httpx.MockTransport` without network.
+
+### 11.4 Token from `GITHUB_TOKEN`, optional
+Read from the env unless passed explicitly; omitted → no `Authorization` header
+(public PRs still work at the unauthenticated 60-req/hr limit).
+
+**Why optional:** public CVE-fix PRs (the eval's bread and butter) are readable
+unauthenticated, so the tool works out of the box; a token only buys rate limit
+and private access. The CLI surfaces this via `GITHUB_TOKEN` (documented in
+`.env.example`), not a flag, to keep the secret out of shell history.
