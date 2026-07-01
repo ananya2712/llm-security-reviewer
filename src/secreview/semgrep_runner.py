@@ -25,7 +25,7 @@ DEFAULT_CONFIGS: tuple[str, ...] = ("p/security-audit", "p/secrets")
 _SEVERITY = {"ERROR": Severity.HIGH, "WARNING": Severity.MEDIUM, "INFO": Severity.LOW}
 
 # CWE id → our Category. Covers the v1 in-scope classes; everything else → OTHER.
-_CWE_CATEGORY: dict[str, Category] = {
+CWE_CATEGORY: dict[str, Category] = {
     "CWE-89": Category.INJECTION,  # SQLi
     "CWE-78": Category.INJECTION,  # OS command
     "CWE-79": Category.INJECTION,  # XSS
@@ -78,8 +78,8 @@ class SemgrepRunner:
         for cwe in metadata.get("cwe", []) or []:
             # entries look like "CWE-89: Improper Neutralization ..."
             key = str(cwe).split(":", 1)[0].strip().upper()
-            if key in _CWE_CATEGORY:
-                return _CWE_CATEGORY[key]
+            if key in CWE_CATEGORY:
+                return CWE_CATEGORY[key]
         return Category.OTHER
 
     def _parse(self, raw: str) -> list[Finding]:

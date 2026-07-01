@@ -4,7 +4,7 @@ Companion to `PLAN.md`. `PLAN.md` is the upfront goal/scope/architecture;
 this doc captures implementation-level decisions made as the code is built,
 with the rationale for each.
 
-Updated through: **step 8 (eval harness — Milestone 2 core)**.
+Updated through: **step 9 (curate.py — dataset workflow)**.
 
 ---
 
@@ -606,6 +606,60 @@ output still needs human CWE verification and line labeling. Building the harnes
 to *consume* a manifest lets the dataset grow independently. The fixtures are
 named `SAMPLE-*` / `SYNTHETIC` so they're never mistaken for real benchmark data.
 
-**Still deferred:** `curate.py` (real dataset), Cohen's κ (LLM–Semgrep
-agreement), and per-diff cost/runtime tracking — all PLAN §5 "nice to haves"
-that don't block a first metrics run once the dataset exists.
+**Still deferred:** Cohen's κ (LLM–Semgrep agreement) and per-diff cost/runtime
+tracking — PLAN §5 "nice to haves" that don't block a first metrics run.
+
+---
+
+## 13. `curate.py` — turning a fix commit into a dataset entry
+
+### 13.1 Curation is human-in-the-loop by design
+`make_candidate("owner/repo@<sha>", …)` does the mechanical work — fetch the fix
+diff, filter to in-scope files, materialize the diff + pre-fix file, and build a
+`DatasetEntry` — but stamps every entry `NEEDS REVIEW` and the CLI prints it for
+inspection rather than committing to `manifest.json` (opt in with
+`--commit-to-manifest`).
+
+**Why not fully automated:** the label that matters most — *which lines are the
+vulnerability* and *what CWE/category* — is a judgment call. A scraper that
+auto-appended entries would silently seed the benchmark with wrong ground truth,
+and every downstream metric would inherit the error. Doing the fetch/filter/
+materialize mechanically (~90% of the effort) while gating the labels behind a
+human keeps the dataset trustworthy. This is the honest read of PLAN §5's
+"hand-verify each one."
+
+### 13.2 `vulnerable_lines` auto-suggested from the *removed* lines
+The strongest cheap signal for "where was the vuln" is the set of lines the fix
+**deleted** — their pre-fix (`source_line_no`) numbers. `suggest_vulnerable_lines`
+returns exactly those.
+
+**Why removed-lines:** a fix diff's removed lines *are* the vulnerable code being
+excised, and their pre-fix line numbers are precisely what the manifest wants.
+It's a suggestion the human confirms — and it degrades honestly: an
+*add-only* fix (inserting a missing check, removing nothing) yields an empty set,
+so we write a placeholder `[1]` and flag it in the note rather than guessing.
+
+### 13.3 Filters: in-scope languages + small fixes only
+Keep only Python/JS/TS files (noise already dropped by `parse_diff`); reject
+commits touching more than `MAX_SOURCE_FILES` (3). The **primary** file (most
+changed lines) anchors `vulnerable_file` / the pre-fix fetch.
+
+**Why:** matches the v1 language scope, and small fixes keep ground truth
+tractable (PLAN §5) — a 20-file refactor-plus-fix is impossible to label
+cleanly. A `CurationError` (not a crash) tells the curator *why* a commit was
+skipped so they move on.
+
+### 13.4 Pre-fix file via the parent commit
+Semgrep needs the vulnerable file *before* the fix, so the curator fetches it at
+the fix commit's **first parent** (`fetch_commit_parent_sha` → `fetch_file` with
+`?ref=<parent>`), extending `github_client` with commit/file endpoints
+(`CommitRef`, `.diff` for commits, raw contents at a ref).
+
+**Why the parent, not `<sha>~1`:** the GitHub contents API resolves a SHA/branch,
+not `~1` syntax, so we read the commit JSON for `parents[0].sha` first. The
+whole flow takes an injectable `GitHubClient`, so `smoke_curate` drives
+fetch→filter→materialize→entry over fakes with no network.
+
+**Shared CWE map:** `semgrep_runner.CWE_CATEGORY` (made public) is reused by
+`suggest_category` so the Semgrep normalizer and the curator agree on
+CWE→category — one table, no drift.

@@ -7,6 +7,7 @@ import httpx
 
 from secreview.github_client import (
     GITHUB_API,
+    CommitRef,
     GitHubClient,
     GitHubError,
     PullRequestRef,
@@ -97,6 +98,44 @@ def main() -> None:
         print("[ok] 403 with exhausted rate limit -> rate-limit GitHubError")
     else:
         raise AssertionError("expected GitHubError on 403 rate limit")
+
+    # --- commit refs: shorthand, URL, rejection ---
+    c = CommitRef.parse("octo/app@abcdef1234567")
+    assert (c.owner, c.repo, c.sha) == ("octo", "app", "abcdef1234567")
+    c2 = CommitRef.parse("https://github.com/octo/app/commit/deadbeef1234")
+    assert c2.sha == "deadbeef1234"
+    for bad in ["octo/app", "octo/app@xyz", "not a ref"]:
+        try:
+            CommitRef.parse(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected ValueError for {bad!r}")
+    print("[ok] CommitRef.parse: shorthand + URL parsed, junk rejected")
+
+    # --- commit diff, parent SHA, and raw file fetch ---
+    routes = {}
+
+    def commit_handler(request: httpx.Request) -> httpx.Response:
+        path, accept = request.url.path, request.headers.get("Accept")
+        routes[(path, accept)] = dict(request.url.params)
+        if path.endswith("/commits/abcdef1234567") and accept == "application/vnd.github.diff":
+            return httpx.Response(200, text=DIFF)
+        if path.endswith("/commits/abcdef1234567"):  # JSON metadata
+            return httpx.Response(200, json={"parents": [{"sha": "parent00sha"}]})
+        if path.endswith("/contents/app/db.py"):
+            return httpx.Response(200, text="raw file body")
+        return httpx.Response(404, text="nope")
+
+    gh = GitHubClient(token="tok", client=_client(commit_handler))
+    assert gh.fetch_commit_diff(c) == DIFF
+    assert gh.fetch_commit_parent_sha(c) == "parent00sha"
+    assert gh.fetch_file("octo", "app", "parent00sha", "app/db.py") == "raw file body"
+    # the file fetch passed ?ref=<parent>
+    assert routes[("/repos/octo/app/contents/app/db.py", "application/vnd.github.raw")] == {
+        "ref": "parent00sha"
+    }
+    print("[ok] fetch_commit_diff / parent SHA / raw file (ref-pinned) work")
 
 
 if __name__ == "__main__":
