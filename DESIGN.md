@@ -4,7 +4,7 @@ Companion to `PLAN.md`. `PLAN.md` is the upfront goal/scope/architecture;
 this doc captures implementation-level decisions made as the code is built,
 with the rationale for each.
 
-Updated through: **step 7 (github_client — Milestone 1 complete)**.
+Updated through: **step 8 (eval harness — Milestone 2 core)**.
 
 ---
 
@@ -527,3 +527,85 @@ Read from the env unless passed explicitly; omitted → no `Authorization` heade
 unauthenticated, so the tool works out of the box; a token only buys rate limit
 and private access. The CLI surfaces this via `GITHUB_TOKEN` (documented in
 `.env.example`), not a flag, to keep the secret out of shell history.
+
+---
+
+## 12. `evals/` + `semgrep_runner.py` — the eval harness (Milestone 2 core)
+
+The harness lives at the repo root (`evals/`, dev-only, not shipped in the
+wheel); only `semgrep_runner.py` sits in the package (it produces `Finding`s the
+CLI could surface too). Pipeline: `manifest → reverse fix → run both tools →
+match → metrics → results/`.
+
+### 12.1 "Reverse the fix" to synthesize a vuln-introducing PR
+`synthesize.reverse_unified_diff` flips a fix diff (vuln→safe) into a diff that
+*adds* the vulnerable lines. It reverses only hunk headers and `+`/`-` markers;
+`diff --git` / `--- ` / `+++ ` header lines are left untouched.
+
+**Why leave the headers:** both name the same path (only the `a/`/`b/` prefix
+differs, which `parse_diff` strips), so leaving them keeps the output a
+well-formed *single-file* diff — swapping `--- `/`+++ ` order tripped unidiff's
+"target without source" and split it into two files. Bonus: the result reads as
+a normal forward PR turning safe code into vulnerable code, which is exactly the
+scenario under test. Load-bearing consequence: the added (vuln) lines carry the
+**pre-fix** file's line numbers, matching the manifest's `vulnerable_lines`.
+Reversal is its own inverse (`reverse(reverse(x)) == x`), which the smoke checks.
+
+### 12.2 `semgrep_runner.py` — file-level, normalized to `Finding`
+Semgrep scans the **pre-fix file** (it's file-level, not diff-level, per PLAN
+§5) via `--config p/security-audit --config p/secrets --json`, mapped to
+`Finding(source="semgrep", confidence=1.0)`. CWE→`Category` via a lookup table;
+`ERROR/WARNING/INFO`→`HIGH/MEDIUM/LOW`. The subprocess is injectable so tests
+feed canned JSON with no Semgrep installed.
+
+**Why `confidence=1.0`:** a rule matched or it didn't — there's no probabilistic
+signal (DESIGN §2.4). Unmapped CWEs fall to `OTHER` rather than forcing a fit.
+
+### 12.3 Matching: category-aware TP, two FP views
+`match_entry` returns `found` (file + ±3-line window + category match),
+`located` (location hit, any category — for localization recall), and the FP
+findings' **categories** under two policies: *generous* (off-file only) and
+*strict* (off-file **plus** on-vuln-file-outside-window). In-window findings are
+never FP (they could be the real vuln).
+
+**Why keep FP categories, not counts:** lets `metrics.py` bucket precision per
+category. **Why two FP views (PLAN §5):** dataset labels are incomplete — a
+finding elsewhere on the vuln file may be a *real* other bug, so counting it as
+FP is noisy; reporting strict and generous brackets the true rate. `±3` absorbs
+off-by-a-few line drift between the reported and labeled lines.
+
+### 12.4 Metrics: per-category + overall, precision reported both ways
+`compute_metrics` emits a `Row` per category plus `OVERALL`, each with recall,
+and strict/generous precision + F1; plus `located_recall`. Zero denominators →
+`0.0`. `write_csv` dumps it for `results/`.
+
+**Why category-aware recall (`found`) as the headline** but `located_recall`
+alongside: the primary number is "did the tool find *this* vuln class here";
+localization recall shows how often it flagged the right spot but mislabeled it
+(e.g. as `OTHER`) — the DESIGN §2.2 `OTHER` question, surfaced as a metric
+rather than baked into matching.
+
+### 12.5 `run_eval` takes injected tool callables
+The orchestrator reads each fix diff, reverses it, and calls a `reviewer(entry,
+reversed_diff)` and `semgrep(entry)` callable; `default_reviewer` /
+`default_semgrep` wire in the real `AnthropicProvider` + `SemgrepRunner`.
+
+**Why callables:** keeps the pure orchestration (read → reverse → match →
+aggregate) hermetically testable with fakes — the `run_eval` smoke drives the
+whole pipeline over the sample dataset with no API key or Semgrep, and even
+asserts the reviewer received the *reversed* diff.
+
+### 12.6 Synthetic sample dataset; real curation deferred
+`dataset/` ships **2 clearly-labeled synthetic fixtures** (an SQLi and a
+hardcoded-secret) — fix diffs + pre-fix files + manifest — so the harness runs
+end-to-end today.
+
+**Why defer `curate.py`:** the real 50-entry CVE-fix dataset is manual data work
+(PLAN §5 curation "hand-verify each one"); a CVEfixes/Advisory-DB scraper's
+output still needs human CWE verification and line labeling. Building the harness
+to *consume* a manifest lets the dataset grow independently. The fixtures are
+named `SAMPLE-*` / `SYNTHETIC` so they're never mistaken for real benchmark data.
+
+**Still deferred:** `curate.py` (real dataset), Cohen's κ (LLM–Semgrep
+agreement), and per-diff cost/runtime tracking — all PLAN §5 "nice to haves"
+that don't block a first metrics run once the dataset exists.

@@ -1,0 +1,28 @@
+[
+  {
+    "id": "SAMPLE-SQLI-PY",
+    "repo": "example/app",
+    "fix_commit": "0000000000000000000000000000000000000001",
+    "cwe": "CWE-89",
+    "category": "INJECTION",
+    "language": "python",
+    "vulnerable_file": "app/db.py",
+    "vulnerable_lines": [12, 13],
+    "fix_diff_path": "diffs/sample_sqli_py.diff",
+    "prefix_file": "prefix/app/db.py",
+    "notes": "SYNTHETIC fixture (not a real CVE). Fix replaces string-built SQL with a parameterized query."
+  },
+  {
+    "id": "SAMPLE-SECRET-JS",
+    "repo": "example/web",
+    "fix_commit": "0000000000000000000000000000000000000002",
+    "cwe": "CWE-798",
+    "category": "SECRET",
+    "language": "javascript",
+    "vulnerable_file": "web/config.js",
+    "vulnerable_lines": [1],
+    "fix_diff_path": "diffs/sample_secret_js.diff",
+    "prefix_file": "prefix/web/config.js",
+    "notes": "SYNTHETIC fixture (not a real CVE). Fix moves a hardcoded API key to an env var."
+  }
+]
